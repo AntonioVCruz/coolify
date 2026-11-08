@@ -1,0 +1,102 @@
+name: testRigor E2E
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testrigor-hosted-suite
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    name: Hosted Coolify regression
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check configuration
+        id: config
+        env:
+          SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
+          TESTRIGOR_API_KEY: ${{ secrets.TESTRIGOR_API_KEY }}
+        run: |
+          if [[ -z "$SUITE_ID" || -z "$TESTRIGOR_API_KEY" ]]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Set TESTRIGOR_SUITE_ID and TESTRIGOR_API_KEY to enable E2E tests."
+            echo "E2E execution skipped: testRigor credentials are not configured." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v5
+        if: steps.config.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        if: steps.config.outputs.enabled == 'true'
+        with:
+          node-version: '22.15.0'
+
+      - name: Install testRigor CLI
+        if: steps.config.outputs.enabled == 'true'
+        run: npm install --global @testrigor/testrigor-cli@2.0.9
+
+      - name: Run the complete hosted suite sequentially
+        id: run_tests
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
+          TESTRIGOR_API_KEY: ${{ secrets.TESTRIGOR_API_KEY }}
+        run: |
+          mkdir -p test-results
+          testrigor --version | tee test-results/cli-version.txt
+          testrigor test-suite run "$SUITE_ID" \
+            --settings-path tests/e2e/settings.json \
+            --junit-report-save-path test-results/junit.xml \
+            2>&1 | tee test-results/cli-run.log
+
+      - name: Summarize and verify full-suite results
+        if: always() && steps.config.outputs.enabled == 'true'
+        env:
+          EXPECTED_TESTS: ${{ vars.TESTRIGOR_EXPECTED_TESTS || '12' }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = ET.parse('test-results/junit.xml')
+          cases = list(report.iter('testcase'))
+          failed = sum(case.find('failure') is not None or case.find('error') is not None for case in cases)
+          skipped = sum(case.find('skipped') is not None for case in cases)
+          passed = len(cases) - failed - skipped
+          log = Path('test-results/cli-run.log').read_text()
+          links = re.findall(r'https://app\.testrigor\.com/(?:test-suites|suites)/[A-Za-z0-9]+/runs/[A-Za-z0-9]+', log)
+          summary = f'## testRigor E2E\n\n{passed} passed, {failed} failed, {skipped} skipped; {len(cases)} total.\n\n'
+          summary += 'Target: the existing hosted Coolify instance configured in the suite. This job does not deploy or test the PR checkout.\n\n'
+          if links:
+              summary += f'[testRigor run]({links[-1]})\n\n'
+          summary += 'JUnit results and CLI output are attached as the testrigor-e2e-results artifact.\n'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write(summary)
+          if failed or skipped or len(cases) != int(os.environ['EXPECTED_TESTS']):
+              raise SystemExit('Expected a complete passing suite with no skipped tests.')
+          PY
+
+      - name: Upload execution evidence
+        if: always() && steps.config.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: testrigor-e2e-results
+          path: test-results/
+          if-no-files-found: error
+          retention-days: 14
